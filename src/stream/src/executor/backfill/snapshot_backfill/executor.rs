@@ -21,10 +21,12 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use futures::future::{try_join_all, Either};
 use futures::{pin_mut, Stream, TryFutureExt, TryStreamExt};
+use risingwave_common::array::stream_record::Record;
 use risingwave_common::array::{Op, StreamChunk};
 use risingwave_common::hash::VnodeBitmapExt;
 use risingwave_common::metrics::LabelGuardedIntCounter;
 use risingwave_common::row::OwnedRow;
+use risingwave_common::util::epoch::EpochPair;
 use risingwave_hummock_sdk::HummockReadEpoch;
 use risingwave_storage::store::PrefetchOptions;
 use risingwave_storage::table::batch_table::storage_table::StorageTable;
@@ -33,11 +35,13 @@ use risingwave_storage::StateStore;
 use tokio::select;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::executor::backfill::snapshot_backfill::state::BackfillState;
+use crate::executor::backfill::snapshot_backfill::state::{
+    BackfillState, EpochBackfillProgress, VnodeBackfillProgress,
+};
 use crate::executor::backfill::snapshot_backfill::vnode_stream::VnodeStream;
 use crate::executor::backfill::utils::{create_builder, mapping_message};
 use crate::executor::monitor::StreamingMetrics;
-use crate::executor::prelude::{try_stream, StreamExt};
+use crate::executor::prelude::{try_stream, StateTable, StreamExt};
 use crate::executor::{
     expect_first_barrier, ActorContextRef, Barrier, BoxedMessageStream, DispatcherBarrier,
     DispatcherMessage, Execute, MergeExecutorInput, Message, StreamExecutorError,
@@ -49,6 +53,9 @@ pub struct SnapshotBackfillExecutor<S: StateStore> {
     /// Upstream table
     upstream_table: StorageTable<S>,
     pk_in_output_indices: Vec<usize>,
+
+    /// Backfill progress table
+    progress_state_table: StateTable<S>,
 
     /// Upstream with the same schema with the upstream table.
     upstream: MergeExecutorInput,
@@ -73,6 +80,7 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         upstream_table: StorageTable<S>,
+        progress_state_table: StateTable<S>,
         upstream: MergeExecutorInput,
         output_indices: Vec<usize>,
         actor_ctx: ActorContextRef,
@@ -82,7 +90,7 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
         barrier_rx: UnboundedReceiver<Barrier>,
         metrics: Arc<StreamingMetrics>,
         snapshot_epoch: Option<u64>,
-    ) -> Self {
+    ) -> StreamExecutorResult<Self> {
         assert_eq!(&upstream.info.schema, upstream_table.schema());
         let Some(pk_in_output_indices) = upstream_table.pk_in_output_indices() else {
             panic!(
@@ -98,9 +106,14 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
                 "create snapshot backfill executor with rate limit"
             );
         }
-        Self {
+        VnodeBackfillProgress::validate_progress_table_schema(
+            progress_state_table.get_data_types(),
+            upstream_table.pk_serializer().get_data_types(),
+        )?;
+        Ok(Self {
             upstream_table,
             pk_in_output_indices,
+            progress_state_table,
             upstream,
             output_indices,
             progress,
@@ -110,11 +123,12 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
             actor_ctx,
             metrics,
             snapshot_epoch,
-        }
+        })
     }
 
     #[try_stream(ok = Message, error = StreamExecutorError)]
     async fn execute_inner(mut self) {
+        let table_id = self.upstream_table.table_id();
         debug!("snapshot backfill executor start");
         let first_upstream_barrier = expect_first_barrier(&mut self.upstream).await?;
         debug!(epoch = ?first_upstream_barrier.epoch, "get first upstream barrier");
@@ -140,11 +154,17 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
                 false
             }
         };
-        let mut backfill_state =
-            BackfillState::new([], self.upstream_table.pk_serializer().clone());
+        let first_recv_barrier_epoch = first_recv_barrier.epoch;
+        yield Message::Barrier(first_recv_barrier);
+        self.progress_state_table
+            .init_epoch(first_recv_barrier_epoch)
+            .await?;
 
-        let (mut barrier_epoch, mut need_report_finish) = {
+        let (mut barrier_epoch, mut need_report_finish, mut backfill_state) = {
             if should_backfill {
+                let mut backfill_state =
+                    BackfillState::new([], self.upstream_table.pk_serializer().clone());
+                assert!(backfill_state.latest_progress().next().is_none());
                 let table_id_str = format!("{}", self.upstream_table.table_id().table_id);
                 let actor_id_str = format!("{}", self.actor_ctx.id);
 
@@ -178,7 +198,8 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
                             &mut self.barrier_rx,
                             &mut self.progress,
                             &mut backfill_state,
-                            first_recv_barrier,
+                            &mut self.progress_state_table,
+                            first_recv_barrier_epoch,
                         );
 
                         pin_mut!(snapshot_stream);
@@ -196,6 +217,7 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
 
                     let recv_barrier = self.barrier_rx.recv().await.expect("should exist");
                     assert_eq!(first_upstream_barrier.epoch, recv_barrier.epoch);
+                    self.progress_state_table.commit(recv_barrier.epoch).await?;
                     yield Message::Barrier(recv_barrier);
                 }
 
@@ -265,9 +287,15 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
                             self.upstream_table.vnodes().iter_vnodes(),
                             barrier.epoch.prev,
                         );
-                        let uncommitted = backfill_state.uncommitted_state();
-                        // TODO: apply to progress state table
-                        drop(uncommitted);
+                        for (_vnode, old_row, new_row) in backfill_state.uncommitted_state() {
+                            let record = if let Some(old_row) = old_row {
+                                Record::Update { old_row, new_row }
+                            } else {
+                                Record::Insert { new_row }
+                            };
+                            self.progress_state_table.write_record(record);
+                        }
+                        self.progress_state_table.commit(barrier.epoch).await?;
                         backfill_state.mark_committed();
                         let update_vnode_bitmap = barrier.as_update_vnode_bitmap(self.actor_ctx.id);
                         yield Message::Barrier(barrier);
@@ -285,15 +313,38 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
                     table_id = self.upstream_table.table_id().table_id,
                     "finish consuming log store"
                 );
-                (barrier_epoch, true)
+                (barrier_epoch, true, backfill_state)
             } else {
+                let pk_serializer = self.upstream_table.pk_serializer();
+                let progress = try_join_all(self.progress_state_table.vnodes().iter_vnodes().map(
+                    |vnode| {
+                        self.progress_state_table
+                            .get_row([vnode.to_datum()])
+                            .map_ok(move |progress_row| {
+                                let progress = VnodeBackfillProgress::from_row(
+                                    &progress_row.expect(
+                                        "should exist because all vnode have same epoch progress",
+                                    ),
+                                    pk_serializer,
+                                );
+                                let expected_progress = VnodeBackfillProgress {
+                                    epoch: first_upstream_barrier.epoch.prev,
+                                    progress: EpochBackfillProgress::Consumed,
+                                };
+                                assert_eq!(progress, expected_progress, "vnode: {:?}", vnode);
+                                (vnode, progress)
+                            })
+                    },
+                ))
+                .await?;
+                let backfill_state =
+                    BackfillState::new(progress, self.upstream_table.pk_serializer().clone());
                 info!(
                     table_id = self.upstream_table.table_id().table_id,
                     "skip backfill"
                 );
-                assert_eq!(first_upstream_barrier.epoch, first_recv_barrier.epoch);
-                yield Message::Barrier(first_recv_barrier);
-                (first_upstream_barrier.epoch, false)
+                assert_eq!(first_upstream_barrier.epoch, first_recv_barrier_epoch);
+                (first_upstream_barrier.epoch, false, backfill_state)
             }
         };
         let mut upstream = self.upstream.into_executor(self.barrier_rx).execute();
@@ -306,24 +357,94 @@ impl<S: StateStore> SnapshotBackfillExecutor<S> {
                         self.upstream_table.vnodes().iter_vnodes(),
                         barrier.epoch.prev,
                     );
+                    let update_vnode_bitmap = barrier.as_update_vnode_bitmap(self.actor_ctx.id);
+                    let is_scale =
+                        update_vnode_bitmap.is_some() || barrier.is_stop(self.actor_ctx.id);
+                    if is_scale {
+                        use itertools::Itertools;
+                        info!(?table_id, vnodes = ?self.upstream_table.vnodes().iter_vnodes().collect_vec(), prev_epoch = barrier.epoch.prev, "write finish epoch");
+                    }
                     barrier_epoch = barrier.epoch;
                     if need_report_finish {
                         need_report_finish = false;
                         self.progress.finish_consuming_log_store(barrier_epoch);
                     }
+                    for (vnode, old_row, new_row) in backfill_state.uncommitted_state() {
+                        let record = if let Some(old_row) = old_row {
+                            Record::Update { old_row, new_row }
+                        } else {
+                            Record::Insert { new_row }
+                        };
+                        if is_scale {
+                            info!(
+                                ?table_id,
+                                ?vnode,
+                                ?record,
+                                "write record before update vnode bitmap"
+                            );
+                        }
+                        self.progress_state_table.write_record(record);
+                    }
+                    self.progress_state_table.commit(barrier.epoch).await?;
                     backfill_state.mark_committed();
-                    let uncommitted = backfill_state.uncommitted_state();
-                    drop(uncommitted);
-                    let update_vnode_bitmap = barrier.as_update_vnode_bitmap(self.actor_ctx.id);
-                    yield Message::Barrier(barrier);
                     if let Some(new_vnode_bitmap) = update_vnode_bitmap {
-                        backfill_state.update_vnode_bitmap(
-                            new_vnode_bitmap
-                                .iter_vnodes()
-                                .map(|vnode| (vnode, barrier_epoch.prev, None)),
-                        );
-                        let _prev_vnode_bitmap =
-                            self.upstream_table.update_vnode_bitmap(new_vnode_bitmap);
+                        yield Message::Barrier(barrier);
+                        self.progress_state_table
+                            .try_wait_committed_epoch(barrier_epoch.prev)
+                            .await?;
+                        let _prev_vnode_bitmap = self
+                            .upstream_table
+                            .update_vnode_bitmap(new_vnode_bitmap.clone());
+                        let (_, _) = self
+                            .progress_state_table
+                            .update_vnode_bitmap(new_vnode_bitmap);
+                        let pk_serializer = self.upstream_table.pk_serializer();
+                        // try_join_all((0..256).map(
+                        //     |vnode| {
+                        //         let vnode = VirtualNode::from_index(vnode);
+                        //         // TODO: remove the clone
+                        //         let pk_serializer = pk_serializer.clone();
+                        //         self.progress_state_table
+                        //             .get_row([vnode.to_datum()])
+                        //             .map_ok(move |progress_row| {
+                        //                 let progress = VnodeBackfillProgress::from_row(
+                        //                     &progress_row.expect("should exist because all vnode have same epoch progress"),
+                        //                     &pk_serializer,
+                        //                 );
+                        //                 let expected_progress = VnodeBackfillProgress {
+                        //                     epoch: barrier_epoch.prev,
+                        //                     progress: EpochBackfillProgress::Consumed,
+                        //                 };
+                        //                 assert_eq!(progress, expected_progress, "{:?}", vnode);
+                        //             })
+                        //     },
+                        // ))
+                        //     .await?;
+                        let progress =
+                            try_join_all(self.progress_state_table.vnodes().iter_vnodes().map(
+                                |vnode| {
+                                    // TODO: remove the clone
+                                    let pk_serializer = pk_serializer.clone();
+                                    self.progress_state_table
+                                        .get_row([vnode.to_datum()])
+                                        .map_ok(move |progress_row| {
+                                            let progress = VnodeBackfillProgress::from_row(
+                                                &progress_row.expect("should exist because all vnode have same epoch progress"),
+                                                &pk_serializer,
+                                            );
+                                            let expected_progress = VnodeBackfillProgress {
+                                                epoch: barrier_epoch.prev,
+                                                progress: EpochBackfillProgress::Consumed,
+                                            };
+                                            assert_eq!(progress, expected_progress, "{:?}", vnode);
+                                            (vnode, progress)
+                                        })
+                                },
+                            ))
+                            .await?;
+                        backfill_state.update_vnode_bitmap(progress);
+                    } else {
+                        yield Message::Barrier(barrier);
                     }
                 }
                 msg => {
@@ -592,10 +713,10 @@ async fn make_consume_snapshot_stream<'a, S: StateStore>(
     barrier_rx: &'a mut UnboundedReceiver<Barrier>,
     progress: &'a mut CreateMviewProgressReporter,
     backfill_state: &'a mut BackfillState,
-    first_recv_barrier: Barrier,
+    progress_state_table: &'a mut StateTable<S>,
+    first_recv_barrier_epoch: EpochPair,
 ) {
-    let mut barrier_epoch = first_recv_barrier.epoch;
-    yield Message::Barrier(first_recv_barrier);
+    let mut barrier_epoch = first_recv_barrier_epoch;
 
     info!(
         table_id = upstream_table.table_id().table_id,
@@ -657,9 +778,15 @@ async fn make_consume_snapshot_stream<'a, S: StateStore>(
                         }
                     })
                     .await?;
-                let uncommitted = backfill_state.uncommitted_state();
-                // TODO: apply to progress state table
-                drop(uncommitted);
+                for (_vnode, old_row, new_row) in backfill_state.uncommitted_state() {
+                    let record = if let Some(old_row) = old_row {
+                        Record::Update { old_row, new_row }
+                    } else {
+                        Record::Insert { new_row }
+                    };
+                    progress_state_table.write_record(record);
+                }
+                progress_state_table.commit(barrier.epoch).await?;
                 backfill_state.mark_committed();
                 debug!(?barrier_epoch, count, epoch_row_count, "update progress");
                 progress.update(barrier_epoch, barrier_epoch.prev, count as _);
@@ -689,9 +816,15 @@ async fn make_consume_snapshot_stream<'a, S: StateStore>(
             backfill_state.finish_epoch([vnode], snapshot_epoch);
         })
         .await?;
-    let uncommitted = backfill_state.uncommitted_state();
-    // TODO: apply to progress state table
-    drop(uncommitted);
+    for (_vnode, old_row, new_row) in backfill_state.uncommitted_state() {
+        let record = if let Some(old_row) = old_row {
+            Record::Update { old_row, new_row }
+        } else {
+            Record::Insert { new_row }
+        };
+        progress_state_table.write_record(record);
+    }
+    progress_state_table.commit(barrier_epoch).await?;
     backfill_state.mark_committed();
     progress.finish(barrier_epoch, count as _);
     yield Message::Barrier(barrier_to_report_finish);
@@ -701,6 +834,7 @@ async fn make_consume_snapshot_stream<'a, S: StateStore>(
         let barrier = receive_next_barrier(barrier_rx).await?;
         assert_eq!(barrier.epoch.prev, barrier_epoch.curr);
         barrier_epoch = barrier.epoch;
+        progress_state_table.commit(barrier.epoch).await?;
         yield Message::Barrier(barrier);
         if barrier_epoch.curr == snapshot_epoch {
             break;

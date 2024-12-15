@@ -49,6 +49,7 @@ use tokio::task::JoinHandle;
 use tonic::Status;
 
 use super::{unique_executor_id, unique_operator_id};
+use crate::common::table::state_table::StateTable;
 use crate::error::StreamResult;
 use crate::executor::exchange::permit::Receiver;
 use crate::executor::monitor::StreamingMetrics;
@@ -356,7 +357,7 @@ impl StreamActorManager {
     }
 
     #[expect(clippy::too_many_arguments)]
-    fn create_snapshot_backfill_node(
+    async fn create_snapshot_backfill_node(
         &self,
         stream_node: &StreamNode,
         node: &StreamScanNode,
@@ -396,10 +397,15 @@ impl StreamActorManager {
         let barrier_rx = local_barrier_manager.subscribe_barrier(actor_context.id);
 
         let upstream_table =
-            StorageTable::new_partial(state_store.clone(), column_ids, vnodes, table_desc);
+            StorageTable::new_partial(state_store.clone(), column_ids, vnodes.clone(), table_desc);
+
+        let state_table = node.get_state_table()?;
+        let state_table =
+            StateTable::from_table_catalog(state_table, state_store.clone(), vnodes).await;
 
         let executor = SnapshotBackfillExecutor::new(
             upstream_table,
+            state_table,
             upstream,
             output_indices,
             actor_context.clone(),
@@ -409,7 +415,7 @@ impl StreamActorManager {
             barrier_rx,
             self.streaming_metrics.clone(),
             node.snapshot_backfill_epoch,
-        )
+        )?
         .boxed();
 
         let info = Self::get_executor_info(
@@ -460,6 +466,7 @@ impl StreamActorManager {
                     local_barrier_manager,
                     store,
                 )
+                .await
             });
         }
 

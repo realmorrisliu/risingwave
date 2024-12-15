@@ -16,6 +16,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::mem::replace;
 
+use anyhow::anyhow;
 use risingwave_common::hash::VirtualNode;
 use risingwave_common::must_match;
 use risingwave_common::row::{OwnedRow, Row, RowExt};
@@ -38,50 +39,74 @@ pub(super) struct VnodeBackfillProgress {
 const EXTRA_COLUMN_TYPES: [DataType; 3] = [DataType::Int16, DataType::Int64, DataType::Boolean];
 
 impl VnodeBackfillProgress {
-    fn from_row(row: &OwnedRow, pk_serde: &OrderedRowSerde) -> (VirtualNode, Self) {
+    pub(super) fn validate_progress_table_schema(
+        progress_table_column_types: &[DataType],
+        upstream_pk_column_types: &[DataType],
+    ) -> StreamExecutorResult<()> {
+        if progress_table_column_types.len()
+            != EXTRA_COLUMN_TYPES.len() + upstream_pk_column_types.len()
+        {
+            return Err(anyhow!(
+                "progress table columns len not matched with the len derived from upstream table pk. progress table: {:?}, pk: {:?}",
+                progress_table_column_types,
+                upstream_pk_column_types)
+                .into()
+            );
+        }
+        for (expected_type, progress_table_type) in EXTRA_COLUMN_TYPES
+            .iter()
+            .chain(upstream_pk_column_types.iter())
+            .zip_eq_debug(progress_table_column_types.iter())
+        {
+            if expected_type != progress_table_type {
+                return Err(anyhow!(
+                    "progress table column not matched with upstream table schema: progress table: {:?}, pk: {:?}",
+                    progress_table_column_types,
+                    upstream_pk_column_types)
+                    .into()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn from_row(row: &OwnedRow, pk_serde: &OrderedRowSerde) -> Self {
         assert_eq!(
             row.len(),
-            pk_serde.get_data_types().len() + EXTRA_COLUMN_TYPES.len()
+            pk_serde.get_data_types().len() + EXTRA_COLUMN_TYPES.len() - 1, // Pk not included
         );
-        let vnode = must_match!(&row[0], Some(ScalarImpl::Int16(vnode)) => {
-           VirtualNode::from_scalar(*vnode)
-        });
-        let epoch = must_match!(&row[1], Some(ScalarImpl::Int64(epoch)) => {
+        let epoch = must_match!(&row[0], Some(ScalarImpl::Int64(epoch)) => {
            *epoch as u64
         });
-        let is_finished = must_match!(&row[2], Some(ScalarImpl::Bool(is_finished)) => {
+        let is_finished = must_match!(&row[1], Some(ScalarImpl::Bool(is_finished)) => {
            *is_finished
         });
-        (
-            vnode,
-            Self {
-                epoch,
-                progress: if is_finished {
-                    EpochBackfillProgress::Consuming {
-                        latest_pk: row.slice(EXTRA_COLUMN_TYPES.len()..).to_owned_row(),
-                    }
-                } else {
-                    row.slice(EXTRA_COLUMN_TYPES.len()..)
-                        .iter()
-                        .enumerate()
-                        .for_each(|(i, datum)| {
-                            if datum.is_some() {
-                                if cfg!(debug_assertions) {
-                                    panic!("get non-empty pk row: {:?}", row);
-                                } else {
-                                    warn!(
-                                        ?vnode,
-                                        i,
-                                        row = ?row,
-                                        "get non-empty pk row. will be ignore"
-                                    );
-                                }
+        Self {
+            epoch,
+            progress: if !is_finished {
+                EpochBackfillProgress::Consuming {
+                    latest_pk: row.slice(EXTRA_COLUMN_TYPES.len()..).to_owned_row(),
+                }
+            } else {
+                row.slice(EXTRA_COLUMN_TYPES.len()..)
+                    .iter()
+                    .enumerate()
+                    .for_each(|(i, datum)| {
+                        if datum.is_some() {
+                            if cfg!(debug_assertions) {
+                                panic!("get non-empty pk row: {:?}", row);
+                            } else {
+                                warn!(
+                                    i,
+                                    row = ?row,
+                                    "get non-empty pk row. will be ignore"
+                                );
                             }
-                        });
-                    EpochBackfillProgress::Consumed
-                },
+                        }
+                    });
+                EpochBackfillProgress::Consumed
             },
-        )
+        }
     }
 }
 
@@ -170,6 +195,9 @@ mod progress_row {
 }
 
 pub(super) use progress_row::*;
+use risingwave_common::util::iter_util::ZipEqDebug;
+
+use crate::executor::StreamExecutorResult;
 
 pub(super) struct BackfillState {
     vnode_state: HashMap<VirtualNode, VnodeBackfillState>,
@@ -178,16 +206,12 @@ pub(super) struct BackfillState {
 }
 
 impl BackfillState {
-    pub(super) fn new<'a>(
-        committed_progress: impl IntoIterator<Item = (VirtualNode, &'a OwnedRow)>,
+    pub(super) fn new(
+        committed_progress: impl IntoIterator<Item = (VirtualNode, VnodeBackfillProgress)>,
         pk_serde: OrderedRowSerde,
     ) -> Self {
         let mut vnode_state = HashMap::new();
-        for (vnode, progress) in committed_progress.into_iter().map(|(vnode, row)| {
-            let (row_vnode, progress) = VnodeBackfillProgress::from_row(row, &pk_serde);
-            assert_eq!(row_vnode, vnode);
-            (vnode, progress)
-        }) {
+        for (vnode, progress) in committed_progress {
             assert!(vnode_state
                 .insert(vnode, VnodeBackfillState::Committed(progress))
                 .is_none());
@@ -207,6 +231,7 @@ impl BackfillState {
                 let prev_progress = state.latest_progress();
                 if prev_progress == &progress {
                     // ignore if no update
+
                     return;
                 }
                 // sanity check
@@ -271,11 +296,12 @@ impl BackfillState {
         }
     }
 
-    #[expect(dead_code)]
-    pub(super) fn latest_progress(&self, vnode: VirtualNode) -> Option<&VnodeBackfillProgress> {
+    pub(super) fn latest_progress(
+        &self,
+    ) -> impl Iterator<Item = (VirtualNode, &VnodeBackfillProgress)> {
         self.vnode_state
-            .get(&vnode)
-            .map(VnodeBackfillState::latest_progress)
+            .iter()
+            .map(|(vnode, state)| (*vnode, VnodeBackfillState::latest_progress(state)))
     }
 
     pub(super) fn uncommitted_state(
@@ -312,16 +338,10 @@ impl BackfillState {
 
     pub(super) fn update_vnode_bitmap(
         &mut self,
-        new_vnodes: impl Iterator<Item = (VirtualNode, u64, Option<OwnedRow>)>,
+        new_vnodes: impl IntoIterator<Item = (VirtualNode, VnodeBackfillProgress)>,
     ) {
         let mut new_state = HashMap::new();
-        for (vnode, epoch, pk) in new_vnodes {
-            let progress = VnodeBackfillProgress {
-                epoch,
-                progress: pk
-                    .map(|latest_pk| EpochBackfillProgress::Consuming { latest_pk })
-                    .unwrap_or(EpochBackfillProgress::Consumed),
-            };
+        for (vnode, progress) in new_vnodes {
             if let Some(prev_progress) = self.vnode_state.get(&vnode) {
                 let prev_progress = must_match!(prev_progress, VnodeBackfillState::Committed(prev_progress) => {
                     prev_progress
