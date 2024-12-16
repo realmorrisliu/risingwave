@@ -15,9 +15,13 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::mem::replace;
+use std::sync::Arc;
 
 use anyhow::anyhow;
-use risingwave_common::hash::VirtualNode;
+use futures::future::try_join_all;
+use futures::TryFutureExt;
+use risingwave_common::bitmap::Bitmap;
+use risingwave_common::hash::{VirtualNode, VnodeBitmapExt};
 use risingwave_common::must_match;
 use risingwave_common::row::{OwnedRow, Row, RowExt};
 use risingwave_common::types::{DataType, ScalarImpl};
@@ -29,7 +33,7 @@ pub(super) enum EpochBackfillProgress {
     Consumed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct VnodeBackfillProgress {
     pub(super) epoch: u64,
     pub(super) progress: EpochBackfillProgress,
@@ -39,7 +43,7 @@ pub(super) struct VnodeBackfillProgress {
 const EXTRA_COLUMN_TYPES: [DataType; 3] = [DataType::Int16, DataType::Int64, DataType::Boolean];
 
 impl VnodeBackfillProgress {
-    pub(super) fn validate_progress_table_schema(
+    fn validate_progress_table_schema(
         progress_table_column_types: &[DataType],
         upstream_pk_column_types: &[DataType],
     ) -> StreamExecutorResult<()> {
@@ -108,8 +112,29 @@ impl VnodeBackfillProgress {
             },
         }
     }
+
+    fn build_row<'a>(
+        &'a self,
+        vnode: VirtualNode,
+        consumed_pk_rows: &'a OwnedRow,
+    ) -> impl Row + 'a {
+        let (is_finished, pk) = match &self.progress {
+            EpochBackfillProgress::Consuming { latest_pk } => {
+                assert_eq!(latest_pk.len(), consumed_pk_rows.len());
+                (false, latest_pk)
+            }
+            EpochBackfillProgress::Consumed => (true, consumed_pk_rows),
+        };
+        [
+            Some(ScalarImpl::Int16(vnode.to_scalar())),
+            Some(ScalarImpl::Int64(self.epoch as _)),
+            Some(ScalarImpl::Bool(is_finished)),
+        ]
+        .chain(pk)
+    }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 enum VnodeBackfillState {
     New(VnodeBackfillProgress),
     Update {
@@ -160,68 +185,61 @@ impl VnodeBackfillState {
     }
 }
 
-mod progress_row {
-    use risingwave_common::hash::VirtualNode;
-    use risingwave_common::row::{OwnedRow, Row, RowExt};
-    use risingwave_common::types::ScalarImpl;
-
-    use crate::executor::backfill::snapshot_backfill::state::{
-        EpochBackfillProgress, VnodeBackfillProgress,
-    };
-
-    pub(in super::super) type BackfillProgressRow<'a> = impl Row + 'a;
-
-    impl VnodeBackfillProgress {
-        pub(super) fn build_row<'a>(
-            &'a self,
-            vnode: VirtualNode,
-            consumed_pk_rows: &'a OwnedRow,
-        ) -> BackfillProgressRow<'a> {
-            let (is_finished, pk) = match &self.progress {
-                EpochBackfillProgress::Consuming { latest_pk } => {
-                    assert_eq!(latest_pk.len(), consumed_pk_rows.len());
-                    (false, latest_pk)
-                }
-                EpochBackfillProgress::Consumed => (true, consumed_pk_rows),
-            };
-            [
-                Some(ScalarImpl::Int16(vnode.to_scalar())),
-                Some(ScalarImpl::Int64(self.epoch as _)),
-                Some(ScalarImpl::Bool(is_finished)),
-            ]
-            .chain(pk)
-        }
-    }
-}
-
-pub(super) use progress_row::*;
+use risingwave_common::util::epoch::EpochPair;
 use risingwave_common::util::iter_util::ZipEqDebug;
+use risingwave_storage::StateStore;
 
+use crate::executor::prelude::StateTable;
 use crate::executor::StreamExecutorResult;
 
-pub(super) struct BackfillState {
+pub(super) struct BackfillState<S: StateStore> {
     vnode_state: HashMap<VirtualNode, VnodeBackfillState>,
     pk_serde: OrderedRowSerde,
     consumed_pk_rows: OwnedRow,
+    state_table: StateTable<S>,
 }
 
-impl BackfillState {
-    pub(super) fn new(
-        committed_progress: impl IntoIterator<Item = (VirtualNode, VnodeBackfillProgress)>,
+impl<S: StateStore> BackfillState<S> {
+    pub(super) async fn new(
+        mut state_table: StateTable<S>,
+        init_epoch: EpochPair,
         pk_serde: OrderedRowSerde,
-    ) -> Self {
+    ) -> StreamExecutorResult<Self> {
+        VnodeBackfillProgress::validate_progress_table_schema(
+            state_table.get_data_types(),
+            pk_serde.get_data_types(),
+        )?;
+        state_table.init_epoch(init_epoch).await?;
         let mut vnode_state = HashMap::new();
-        for (vnode, progress) in committed_progress {
+        let committed_progress_row = Self::load_vnode_progress_row(&state_table).await?;
+        for (vnode, progress_row) in committed_progress_row {
+            let Some(progress_row) = progress_row else {
+                continue;
+            };
+            let progress = VnodeBackfillProgress::from_row(&progress_row, &pk_serde);
             assert!(vnode_state
                 .insert(vnode, VnodeBackfillState::Committed(progress))
                 .is_none());
         }
         let consumed_pk_rows = OwnedRow::new(vec![None; pk_serde.get_data_types().len()]);
-        Self {
+        Ok(Self {
             vnode_state,
             pk_serde,
             consumed_pk_rows,
-        }
+            state_table,
+        })
+    }
+
+    async fn load_vnode_progress_row(
+        state_table: &StateTable<S>,
+    ) -> StreamExecutorResult<Vec<(VirtualNode, Option<OwnedRow>)>> {
+        let rows = try_join_all(state_table.vnodes().iter_vnodes().map(|vnode| {
+            state_table
+                .get_row([vnode.to_datum()])
+                .map_ok(move |progress_row| (vnode, progress_row))
+        }))
+        .await?;
+        Ok(rows)
     }
 
     fn update_progress(&mut self, vnode: VirtualNode, progress: VnodeBackfillProgress) {
@@ -298,60 +316,65 @@ impl BackfillState {
 
     pub(super) fn latest_progress(
         &self,
-    ) -> impl Iterator<Item = (VirtualNode, &VnodeBackfillProgress)> {
-        self.vnode_state
-            .iter()
-            .map(|(vnode, state)| (*vnode, VnodeBackfillState::latest_progress(state)))
+    ) -> impl Iterator<Item = (VirtualNode, Option<&VnodeBackfillProgress>)> {
+        self.state_table.vnodes().iter_vnodes().map(|vnode| {
+            (
+                vnode,
+                self.vnode_state
+                    .get(&vnode)
+                    .map(VnodeBackfillState::latest_progress),
+            )
+        })
     }
 
-    pub(super) fn uncommitted_state(
-        &self,
-    ) -> impl Iterator<
-        Item = (
-            VirtualNode,
-            Option<BackfillProgressRow<'_>>,
-            BackfillProgressRow<'_>,
-        ),
-    > + '_ {
-        self.vnode_state
-            .iter()
-            .filter_map(|(vnode, state)| match state {
-                VnodeBackfillState::New(progress) => Some((
-                    *vnode,
-                    None,
-                    progress.build_row(*vnode, &self.consumed_pk_rows),
-                )),
-                VnodeBackfillState::Update { latest, committed } => Some((
-                    *vnode,
-                    Some(committed.build_row(*vnode, &self.consumed_pk_rows)),
-                    latest.build_row(*vnode, &self.consumed_pk_rows),
-                )),
-                VnodeBackfillState::Committed(_) => None,
-            })
-    }
-
-    pub(super) fn mark_committed(&mut self) {
+    pub(super) async fn commit(&mut self, barrier_epoch: EpochPair) -> StreamExecutorResult<()> {
+        for (vnode, state) in &self.vnode_state {
+            match state {
+                VnodeBackfillState::New(progress) => {
+                    self.state_table
+                        .insert(progress.build_row(*vnode, &self.consumed_pk_rows));
+                }
+                VnodeBackfillState::Update { latest, committed } => {
+                    self.state_table.update(
+                        committed.build_row(*vnode, &self.consumed_pk_rows),
+                        latest.build_row(*vnode, &self.consumed_pk_rows),
+                    );
+                }
+                VnodeBackfillState::Committed(_) => {}
+            }
+        }
+        self.state_table.commit(barrier_epoch).await?;
         self.vnode_state
             .values_mut()
-            .for_each(VnodeBackfillState::mark_committed)
+            .for_each(VnodeBackfillState::mark_committed);
+        Ok(())
     }
 
-    pub(super) fn update_vnode_bitmap(
+    pub(super) async fn update_vnode_bitmap(
         &mut self,
-        new_vnodes: impl IntoIterator<Item = (VirtualNode, VnodeBackfillProgress)>,
-    ) {
+        new_vnode_bitmap: Arc<Bitmap>,
+        barrier_epoch: EpochPair,
+    ) -> StreamExecutorResult<()> {
+        self.state_table
+            .try_wait_committed_epoch(barrier_epoch.prev)
+            .await?;
+        let (prev_vnode_bitmap, _) = self.state_table.update_vnode_bitmap(new_vnode_bitmap);
+        let committed_progress_rows = Self::load_vnode_progress_row(&self.state_table).await?;
         let mut new_state = HashMap::new();
-        for (vnode, progress) in new_vnodes {
-            if let Some(prev_progress) = self.vnode_state.get(&vnode) {
-                let prev_progress = must_match!(prev_progress, VnodeBackfillState::Committed(prev_progress) => {
-                    prev_progress
-                });
-                assert_eq!(prev_progress, &progress);
+        for (vnode, progress_row) in committed_progress_rows {
+            if let Some(progress_row) = progress_row {
+                let progress = VnodeBackfillProgress::from_row(&progress_row, &self.pk_serde);
+                assert!(new_state
+                    .insert(vnode, VnodeBackfillState::Committed(progress))
+                    .is_none());
             }
-            assert!(new_state
-                .insert(vnode, VnodeBackfillState::Committed(progress))
-                .is_none());
+
+            if prev_vnode_bitmap.is_set(vnode.to_index()) {
+                // if the vnode exist previously, the new state should be the same as the previous one
+                assert_eq!(self.vnode_state.get(&vnode), new_state.get(&vnode));
+            }
         }
         self.vnode_state = new_state;
+        Ok(())
     }
 }

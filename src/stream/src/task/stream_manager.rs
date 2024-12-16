@@ -415,7 +415,7 @@ impl StreamActorManager {
             barrier_rx,
             self.streaming_metrics.clone(),
             node.snapshot_backfill_epoch,
-        )?
+        )
         .boxed();
 
         let info = Self::get_executor_info(
