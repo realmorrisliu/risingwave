@@ -55,9 +55,7 @@ use crate::scheduler::task_context::FrontendBatchTaskContext;
 use crate::scheduler::{SchedulerError, SchedulerResult};
 use crate::session::{FrontendEnv, SessionImpl};
 
-// TODO(error-handling): use a concrete error type.
-pub type LocalQueryStream = ReceiverStream<Result<DataChunk, BoxedError>>;
-pub struct LocalQueryExecution {
+pub struct FastInsertExecution {
     sql: String,
     query: Query,
     front_env: FrontendEnv,
@@ -67,7 +65,7 @@ pub struct LocalQueryExecution {
     timeout: Option<Duration>,
 }
 
-impl LocalQueryExecution {
+impl FastInsertExecution {
     pub fn new<S: Into<String>>(
         query: Query,
         front_env: FrontendEnv,
