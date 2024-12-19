@@ -114,9 +114,11 @@ pub(super) mod handlers {
         };
         println!("WKXLOG webhook source info: {:?}", secret_ref);
 
-        let secret_string = LocalSecretManager::global()
-            .fill_secret(secret_ref.unwrap())
-            .map_err(|e| err(e, StatusCode::NOT_FOUND))?;
+        // let secret_string = LocalSecretManager::global()
+        //     .fill_secret(secret_ref.unwrap())
+        //     .map_err(|e| err(e, StatusCode::NOT_FOUND))?;
+
+        let secret_string = String::from("TEST_WEBHOOK");
 
         println!("WKXLOG secret string: {:?}", secret_string);
         // Once limitation here is that the key is no longer case-insensitive, users must user the lowercase key when defining the webhook source table.
