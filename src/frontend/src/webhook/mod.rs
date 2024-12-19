@@ -31,7 +31,9 @@ use tower_http::add_extension::AddExtensionLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{self, CorsLayer};
 
-use crate::handler::handle;
+use crate::handler::fast_insert::handle_fast_insert;
+use crate::handler::{handle, HandlerArgs};
+use crate::scheduler::{run_inner_call, run_inner_call_2, FrontendBatchTaskContext};
 use crate::webhook::utils::{err, Result};
 mod utils;
 
@@ -69,6 +71,10 @@ pub(super) mod handlers {
         // Can be any address, we use the port of meta to indicate that it's a internal request.
         let dummy_addr = Address::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 5691));
 
+        println!(
+            "WKXLOG Received webhook request for {}/{}/{}",
+            database, schema, table
+        );
         // TODO(kexiang): optimize this
         // get a session object for the corresponding database
         let session = session_mgr
@@ -82,7 +88,7 @@ pub(super) mod handlers {
                     StatusCode::UNAUTHORIZED,
                 )
             })?;
-
+        println!("WKXLOG session created");
         let WebhookSourceInfo {
             secret_ref,
             signature_expr,
@@ -106,11 +112,13 @@ pub(super) mod handlers {
                 })?
                 .clone()
         };
+        println!("WKXLOG webhook source info: {:?}", secret_ref);
 
         let secret_string = LocalSecretManager::global()
             .fill_secret(secret_ref.unwrap())
             .map_err(|e| err(e, StatusCode::NOT_FOUND))?;
 
+        println!("WKXLOG secret string: {:?}", secret_string);
         // Once limitation here is that the key is no longer case-insensitive, users must user the lowercase key when defining the webhook source table.
         let headers_jsonb = header_map_to_json(&headers);
 
@@ -121,6 +129,8 @@ pub(super) mod handlers {
             signature_expr.unwrap(),
         )
         .await?;
+
+        println!("WKXLOG is_valid: {:?}", is_valid);
 
         if !is_valid {
             return Err(err(
@@ -152,14 +162,53 @@ pub(super) mod handlers {
             returning: vec![],
         };
 
-        let _rsp = handle(session, insert_stmt, Arc::from(""), vec![])
-            .await
-            .map_err(|e| {
+        println!("WKXLOG insert_stmt done");
+
+        let _guard = session.txn_begin_implicit();
+        let handler_args =
+            HandlerArgs::new(session.clone(), &insert_stmt, Arc::from("")).map_err(|e| {
                 err(
                     anyhow!(e).context("Failed to insert into target table"),
                     StatusCode::INTERNAL_SERVER_ERROR,
                 )
             })?;
+
+        let context = FrontendBatchTaskContext::new(session.clone());
+
+        let execution = handle_fast_insert(handler_args, insert_stmt)
+            .await
+            .map_err(|e| {
+                println!("WKXLOG handle_fast_insert error: {:?}", e);
+                err(
+                    anyhow!(e).context("Failed to insert into target table"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            })?;
+        let plan = execution.gen_plan().map_err(|e| {
+            err(
+                anyhow!(e).context("Failed to insert into target table"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        })?;
+        let epoch = execution.epoch();
+        run_inner_call_2(&plan, epoch, context, session)
+            .await
+            .map_err(|e| {
+                println!("WKXLOG run_inner_call error: {:?}", e);
+                err(
+                    anyhow!(e).context("Failed to insert into target table"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            })?;
+
+        // let _rsp = handle(session, insert_stmt, Arc::from(""), vec![])
+        //     .await
+        // .map_err(|e| {
+        //     err(
+        //         anyhow!(e).context("Failed to insert into target table"),
+        //         StatusCode::INTERNAL_SERVER_ERROR,
+        //     )
+        // })?;
 
         Ok(())
     }

@@ -14,48 +14,28 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
-use itertools::Itertools;
-use pgwire::pg_field_descriptor::PgFieldDescriptor;
-use pgwire::pg_response::{PgResponse, StatementType};
-use pgwire::types::Format;
-use risingwave_batch::worker_manager::worker_node_manager::WorkerNodeSelector;
-use risingwave_common::bail_not_implemented;
-use risingwave_common::catalog::{FunctionId, Schema};
-use risingwave_common::session_config::QueryMode;
-use risingwave_common::types::{DataType, Datum};
-use risingwave_sqlparser::ast::{SetExpr, Statement};
+use pgwire::pg_response::StatementType;
+use risingwave_common::error::BoxedError;
+use risingwave_pb::batch_plan::PlanFragment;
+use risingwave_sqlparser::ast::Statement;
+use tokio::sync::mpsc;
 
-use super::extended_handle::{PortalResult, PrepareStatement, PreparedResult};
-use super::{create_mv, declare_cursor, PgResponseStream, RwPgResponse};
-use crate::binder::{Binder, BoundCreateView, BoundStatement};
 use crate::catalog::TableId;
-use crate::error::{ErrorCode, Result, RwError};
-use crate::handler::flush::do_flush;
-use crate::handler::privilege::resolve_privileges;
-use crate::handler::query::{gen_batch_plan_by_statement, gen_batch_plan_fragmenter};
-use crate::handler::util::{to_pg_field, DataChunkToRowSetAdapter};
+use crate::error::Result;
+use crate::handler::query::{
+    gen_batch_plan_by_statement, gen_batch_plan_fragmenter, BatchPlanFragmenterResult,
+};
 use crate::handler::HandlerArgs;
-use crate::optimizer::plan_node::Explain;
-use crate::optimizer::{
-    ExecutionModeDecider, OptimizerContext, OptimizerContextRef, ReadStorageTableVisitor,
-    RelationCollectorVisitor, SysTableVisitor,
-};
-use crate::planner::Planner;
+use crate::optimizer::OptimizerContext;
 use crate::scheduler::plan_fragmenter::Query;
-use crate::scheduler::{
-    BatchPlanFragmenter, DistributedQueryStream, ExecutionContext, ExecutionContextRef,
-    LocalQueryExecution, LocalQueryStream,
-};
+use crate::scheduler::FastInsertExecution;
 use crate::session::SessionImpl;
-use crate::PlanRef;
 
-pub async fn gen_fast_insert_execution(
+pub async fn handle_fast_insert(
     handler_args: HandlerArgs,
     stmt: Statement,
-    formats: Vec<Format>,
-) -> Result<RwPgResponse> {
+) -> Result<FastInsertExecution> {
     assert!(matches!(stmt, Statement::Insert { .. }));
     let session = handler_args.session.clone();
 
@@ -67,65 +47,67 @@ pub async fn gen_fast_insert_execution(
 
     let BatchPlanFragmenterResult {
         plan_fragmenter,
-        _query_mode,
-        schema,
         stmt_type,
         read_storage_tables,
+        ..
     } = plan_fragmenter_result;
     assert!(matches!(stmt_type, StatementType::INSERT));
 
     // Acquire the write guard for DML statements.
-    session.txn_write_guard()?;
+    // session.txn_write_guard()?;
 
     let query = plan_fragmenter.generate_complete_query().await?;
     tracing::trace!("Generated query after plan fragmenter: {:?}", &query);
 
-    let pg_descs = schema
-        .fields()
-        .iter()
-        .map(to_pg_field)
-        .collect::<Vec<PgFieldDescriptor>>();
-    let column_types = schema.fields().iter().map(|f| f.data_type()).collect_vec();
-
-    let stream = PgResponseStream::LocalQuery(DataChunkToRowSetAdapter::new(
-        local_execute(
-            session.clone(),
-            query,
-            can_timeout_cancel,
-            &read_storage_tables,
-        )
-        .await?,
-        column_types,
-        formats,
-        session.clone(),
-    ));
-
-    let (row_stream, pg_descs) =
-        create_stream(session.clone(), plan_fragmenter_result, formats).await?;
-    todo!()
+    gen_fast_insert_plan_inner(session, query, &read_storage_tables)
 }
 
-pub async fn local_execute(
+fn gen_fast_insert_plan_inner(
     session: Arc<SessionImpl>,
     query: Query,
-    can_timeout_cancel: bool,
     read_storage_tables: &HashSet<TableId>,
-) -> Result<LocalQueryStream> {
-    let timeout = None;
+) -> Result<FastInsertExecution> {
     let front_env = session.env();
-
     let snapshot = session.pinned_snapshot();
 
     // TODO: Passing sql here
-    let execution = LocalQueryExecution::new(
+    let execution = FastInsertExecution::new(
         query,
         front_env.clone(),
-        "",
         snapshot.support_barrier_read(),
         snapshot.batch_query_epoch(read_storage_tables)?,
         session,
-        timeout,
     );
 
-    Ok(execution.stream_rows())
+    // Ok(execution.gen_plan()?)
+    Ok(execution)
 }
+
+// pub async fn run_fast_insert(plan: PlanFragment) -> Result<()> {
+//     let compute_runtime = self.front_env.compute_runtime();
+//     let (sender, mut receiver) = mpsc::channel(10);
+//     // let shutdown_rx = self.shutdown_rx().clone();
+//     let sender1 = sender.clone();
+//     let exec = async move {
+//         let mut data_stream = self.run().map(|r| r.map_err(|e| Box::new(e) as BoxedError));
+//         while let Some(r) = data_stream.next().await {
+//             // append a query cancelled error if the query is cancelled.
+//             // if r.is_err() && shutdown_rx.is_cancelled() {
+//             //     r = Err(Box::new(SchedulerError::QueryCancelled(
+//             //         "Cancelled by user".to_string(),
+//             //     )) as BoxedError);
+//             // }
+//             if sender1.send(r).await.is_err() {
+//                 tracing::info!("Receiver closed.");
+//                 return;
+//             }
+//         }
+//     };
+
+//     compute_runtime.spawn(exec);
+
+//     while let Some(result) = receiver.recv().await {
+//         result?;
+//     }
+//     Ok(())
+// }

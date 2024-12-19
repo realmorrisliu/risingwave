@@ -16,24 +16,22 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::anyhow;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use futures_async_stream::try_stream;
 use itertools::Itertools;
-use pgwire::pg_server::BoxedError;
 use risingwave_batch::error::BatchError;
 use risingwave_batch::executor::ExecutorBuilder;
 use risingwave_batch::task::{ShutdownToken, TaskId};
 use risingwave_batch::worker_manager::worker_node_manager::WorkerNodeSelector;
 use risingwave_common::array::DataChunk;
 use risingwave_common::bail;
+use risingwave_common::error::BoxedError;
 use risingwave_common::hash::WorkerSlotMapping;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::tracing::{InstrumentStream, TracingContext};
-use risingwave_connector::source::SplitMetaData;
 use risingwave_pb::batch_plan::exchange_info::DistributionMode;
 use risingwave_pb::batch_plan::exchange_source::LocalExecutePlan::Plan;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
@@ -42,8 +40,6 @@ use risingwave_pb::batch_plan::{
     TaskOutputId,
 };
 use risingwave_pb::common::{BatchQueryEpoch, WorkerNode};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use super::plan_fragmenter::{PartitionInfo, QueryStage, QueryStageRef};
@@ -56,37 +52,30 @@ use crate::scheduler::{SchedulerError, SchedulerResult};
 use crate::session::{FrontendEnv, SessionImpl};
 
 pub struct FastInsertExecution {
-    sql: String,
     query: Query,
     front_env: FrontendEnv,
     batch_query_epoch: BatchQueryEpoch,
     session: Arc<SessionImpl>,
     worker_node_manager: WorkerNodeSelector,
-    timeout: Option<Duration>,
 }
 
 impl FastInsertExecution {
-    pub fn new<S: Into<String>>(
+    pub fn new(
         query: Query,
         front_env: FrontendEnv,
-        sql: S,
         support_barrier_read: bool,
         batch_query_epoch: BatchQueryEpoch,
         session: Arc<SessionImpl>,
-        timeout: Option<Duration>,
     ) -> Self {
-        let sql = sql.into();
         let worker_node_manager =
             WorkerNodeSelector::new(front_env.worker_node_manager_ref(), support_barrier_read);
 
         Self {
-            sql,
             query,
             front_env,
             batch_query_epoch,
             session,
             worker_node_manager,
-            timeout,
         }
     }
 
@@ -96,8 +85,6 @@ impl FastInsertExecution {
 
     #[try_stream(ok = DataChunk, error = RwError)]
     pub async fn run_inner(self) {
-        debug!(%self.query.query_id, self.sql, "Starting to run query");
-
         let context = FrontendBatchTaskContext::new(self.session.clone());
 
         let task_id = TaskId {
@@ -129,88 +116,14 @@ impl FastInsertExecution {
         }
     }
 
-    fn run(self) -> BoxStream<'static, Result<DataChunk, RwError>> {
-        let span = tracing::info_span!(
-            "local_execute",
-            query_id = self.query.query_id.id,
-            epoch = ?self.batch_query_epoch,
-        );
-        Box::pin(self.run_inner().instrument(span))
+    pub fn epoch(&self) -> BatchQueryEpoch {
+        self.batch_query_epoch
     }
 
-    pub fn stream_rows(self) -> LocalQueryStream {
-        let compute_runtime = self.front_env.compute_runtime();
-        let (sender, receiver) = mpsc::channel(10);
-        let shutdown_rx = self.shutdown_rx().clone();
-
-        let catalog_reader = self.front_env.catalog_reader().clone();
-        let user_info_reader = self.front_env.user_info_reader().clone();
-        let auth_context = self.session.auth_context().clone();
-        let db_name = self.session.database().to_string();
-        let search_path = self.session.config().search_path();
-        let time_zone = self.session.config().timezone();
-        let strict_mode = self.session.config().batch_expr_strict_mode();
-        let timeout = self.timeout;
-        let meta_client = self.front_env.meta_client_ref();
-
-        let sender1 = sender.clone();
-        let exec = async move {
-            let mut data_stream = self.run().map(|r| r.map_err(|e| Box::new(e) as BoxedError));
-            while let Some(mut r) = data_stream.next().await {
-                // append a query cancelled error if the query is cancelled.
-                if r.is_err() && shutdown_rx.is_cancelled() {
-                    r = Err(Box::new(SchedulerError::QueryCancelled(
-                        "Cancelled by user".to_string(),
-                    )) as BoxedError);
-                }
-                if sender1.send(r).await.is_err() {
-                    tracing::info!("Receiver closed.");
-                    return;
-                }
-            }
-        };
-
-        use risingwave_expr::expr_context::*;
-
-        use crate::expr::function_impl::context::{
-            AUTH_CONTEXT, CATALOG_READER, DB_NAME, META_CLIENT, SEARCH_PATH, USER_INFO_READER,
-        };
-
-        // box is necessary, otherwise the size of `exec` will double each time it is nested.
-        let exec = async move { CATALOG_READER::scope(catalog_reader, exec).await }.boxed();
-        let exec = async move { USER_INFO_READER::scope(user_info_reader, exec).await }.boxed();
-        let exec = async move { DB_NAME::scope(db_name, exec).await }.boxed();
-        let exec = async move { SEARCH_PATH::scope(search_path, exec).await }.boxed();
-        let exec = async move { AUTH_CONTEXT::scope(auth_context, exec).await }.boxed();
-        let exec = async move { TIME_ZONE::scope(time_zone, exec).await }.boxed();
-        let exec = async move { STRICT_MODE::scope(strict_mode, exec).await }.boxed();
-        let exec = async move { META_CLIENT::scope(meta_client, exec).await }.boxed();
-
-        if let Some(timeout) = timeout {
-            let exec = async move {
-                if let Err(_e) = tokio::time::timeout(timeout, exec).await {
-                    tracing::error!(
-                        "Local query execution timeout after {} seconds",
-                        timeout.as_secs()
-                    );
-                    if sender
-                        .send(Err(Box::new(SchedulerError::QueryCancelled(format!(
-                            "timeout after {} seconds",
-                            timeout.as_secs(),
-                        ))) as BoxedError))
-                        .await
-                        .is_err()
-                    {
-                        tracing::info!("Receiver closed.");
-                    }
-                }
-            };
-            compute_runtime.spawn(exec);
-        } else {
-            compute_runtime.spawn(exec);
-        }
-
-        ReceiverStream::new(receiver)
+    pub fn gen_plan(&self) -> SchedulerResult<PlanFragment> {
+        let plan_fragment = self.create_plan_fragment()?;
+        // let plan_node = plan_fragment.root.unwrap();
+        Ok(plan_fragment)
     }
 
     /// Convert query to plan fragment.
@@ -358,91 +271,6 @@ impl FastInsertExecution {
                         };
                         sources.push(exchange_source);
                     }
-                } else if let Some(source_info) = &second_stage.source_info {
-                    // For file source batch read, all the files  to be read  are divide into several parts to prevent the task from taking up too many resources.
-
-                    let chunk_size = (source_info.split_info().unwrap().len() as f32
-                        / (self.worker_node_manager.schedule_unit_count()) as f32)
-                        .ceil() as usize;
-                    for (id, split) in source_info
-                        .split_info()
-                        .unwrap()
-                        .chunks(chunk_size)
-                        .enumerate()
-                    {
-                        let second_stage_plan_node = self.convert_plan_node(
-                            &second_stage.root,
-                            &mut None,
-                            Some(PartitionInfo::Source(split.to_vec())),
-                            next_executor_id.clone(),
-                        )?;
-                        let second_stage_plan_fragment = PlanFragment {
-                            root: Some(second_stage_plan_node),
-                            exchange_info: Some(ExchangeInfo {
-                                mode: DistributionMode::Single as i32,
-                                ..Default::default()
-                            }),
-                        };
-                        let local_execute_plan = LocalExecutePlan {
-                            plan: Some(second_stage_plan_fragment),
-                            epoch: Some(self.batch_query_epoch),
-                            tracing_context: tracing_context.clone(),
-                        };
-                        // NOTE: select a random work node here.
-                        let worker_node = self.worker_node_manager.next_random_worker()?;
-                        let exchange_source = ExchangeSource {
-                            task_output_id: Some(TaskOutputId {
-                                task_id: Some(PbTaskId {
-                                    task_id: id as u64,
-                                    stage_id: exchange_source_stage_id,
-                                    query_id: self.query.query_id.id.clone(),
-                                }),
-                                output_id: 0,
-                            }),
-                            host: Some(worker_node.host.as_ref().unwrap().clone()),
-                            local_execute_plan: Some(Plan(local_execute_plan)),
-                        };
-                        sources.push(exchange_source);
-                    }
-                } else if let Some(file_scan_info) = &second_stage.file_scan_info {
-                    let chunk_size = (file_scan_info.file_location.len() as f32
-                        / (self.worker_node_manager.schedule_unit_count()) as f32)
-                        .ceil() as usize;
-                    for (id, files) in file_scan_info.file_location.chunks(chunk_size).enumerate() {
-                        let second_stage_plan_node = self.convert_plan_node(
-                            &second_stage.root,
-                            &mut None,
-                            Some(PartitionInfo::File(files.to_vec())),
-                            next_executor_id.clone(),
-                        )?;
-                        let second_stage_plan_fragment = PlanFragment {
-                            root: Some(second_stage_plan_node),
-                            exchange_info: Some(ExchangeInfo {
-                                mode: DistributionMode::Single as i32,
-                                ..Default::default()
-                            }),
-                        };
-                        let local_execute_plan = LocalExecutePlan {
-                            plan: Some(second_stage_plan_fragment),
-                            epoch: Some(self.batch_query_epoch),
-                            tracing_context: tracing_context.clone(),
-                        };
-                        // NOTE: select a random work node here.
-                        let worker_node = self.worker_node_manager.next_random_worker()?;
-                        let exchange_source = ExchangeSource {
-                            task_output_id: Some(TaskOutputId {
-                                task_id: Some(PbTaskId {
-                                    task_id: id as u64,
-                                    stage_id: exchange_source_stage_id,
-                                    query_id: self.query.query_id.id.clone(),
-                                }),
-                                output_id: 0,
-                            }),
-                            host: Some(worker_node.host.as_ref().unwrap().clone()),
-                            local_execute_plan: Some(Plan(local_execute_plan)),
-                        };
-                        sources.push(exchange_source);
-                    }
                 } else {
                     let second_stage_plan_node = self.convert_plan_node(
                         &second_stage.root,
@@ -494,147 +322,6 @@ impl FastInsertExecution {
                     node_body: Some(node_body),
                 })
             }
-            PlanNodeType::BatchSeqScan => {
-                let mut node_body = execution_plan_node.node.clone();
-                match &mut node_body {
-                    NodeBody::RowSeqScan(ref mut scan_node) => {
-                        if let Some(partition) = partition {
-                            let partition = partition
-                                .into_table()
-                                .expect("PartitionInfo should be TablePartitionInfo here");
-                            scan_node.vnode_bitmap = Some(partition.vnode_bitmap.to_protobuf());
-                            scan_node.scan_ranges = partition.scan_ranges;
-                        }
-                    }
-                    NodeBody::SysRowSeqScan(_) => {}
-                    _ => unreachable!(),
-                }
-
-                Ok(PbPlanNode {
-                    children: vec![],
-                    identity,
-                    node_body: Some(node_body),
-                })
-            }
-            PlanNodeType::BatchLogSeqScan => {
-                let mut node_body = execution_plan_node.node.clone();
-                match &mut node_body {
-                    NodeBody::LogRowSeqScan(ref mut scan_node) => {
-                        if let Some(partition) = partition {
-                            let partition = partition
-                                .into_table()
-                                .expect("PartitionInfo should be TablePartitionInfo here");
-                            scan_node.vnode_bitmap = Some(partition.vnode_bitmap.to_protobuf());
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-
-                Ok(PbPlanNode {
-                    children: vec![],
-                    identity,
-                    node_body: Some(node_body),
-                })
-            }
-            PlanNodeType::BatchFileScan => {
-                let mut node_body = execution_plan_node.node.clone();
-                match &mut node_body {
-                    NodeBody::FileScan(ref mut file_scan_node) => {
-                        if let Some(partition) = partition {
-                            let partition = partition
-                                .into_file()
-                                .expect("PartitionInfo should be FilePartitionInfo here");
-                            file_scan_node.file_location = partition;
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-
-                Ok(PbPlanNode {
-                    children: vec![],
-                    identity,
-                    node_body: Some(node_body),
-                })
-            }
-            PlanNodeType::BatchSource | PlanNodeType::BatchKafkaScan => {
-                let mut node_body = execution_plan_node.node.clone();
-                match &mut node_body {
-                    NodeBody::Source(ref mut source_node) => {
-                        if let Some(partition) = partition {
-                            let partition = partition
-                                .into_source()
-                                .expect("PartitionInfo should be SourcePartitionInfo here");
-                            source_node.split = partition
-                                .into_iter()
-                                .map(|split| split.encode_to_bytes().into())
-                                .collect_vec();
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-
-                Ok(PbPlanNode {
-                    children: vec![],
-                    identity,
-                    node_body: Some(node_body),
-                })
-            }
-            PlanNodeType::BatchIcebergScan => {
-                let mut node_body = execution_plan_node.node.clone();
-                match &mut node_body {
-                    NodeBody::IcebergScan(ref mut iceberg_scan_node) => {
-                        if let Some(partition) = partition {
-                            let partition = partition
-                                .into_source()
-                                .expect("PartitionInfo should be SourcePartitionInfo here");
-                            iceberg_scan_node.split = partition
-                                .into_iter()
-                                .map(|split| split.encode_to_bytes().into())
-                                .collect_vec();
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-
-                Ok(PbPlanNode {
-                    children: vec![],
-                    identity,
-                    node_body: Some(node_body),
-                })
-            }
-            PlanNodeType::BatchLookupJoin => {
-                let mut node_body = execution_plan_node.node.clone();
-                match &mut node_body {
-                    NodeBody::LocalLookupJoin(node) => {
-                        let side_table_desc = node
-                            .inner_side_table_desc
-                            .as_ref()
-                            .expect("no side table desc");
-                        let mapping = self.worker_node_manager.fragment_mapping(
-                            self.get_fragment_id(&side_table_desc.table_id.into())?,
-                        )?;
-
-                        // TODO: should we use `pb::WorkerSlotMapping` here?
-                        node.inner_side_vnode_mapping =
-                            mapping.to_expanded().into_iter().map(u64::from).collect();
-                        node.worker_nodes = self.worker_node_manager.manager.list_worker_nodes();
-                    }
-                    _ => unreachable!(),
-                }
-
-                let left_child = self.convert_plan_node(
-                    &execution_plan_node.children[0],
-                    second_stages,
-                    partition,
-                    next_executor_id,
-                )?;
-
-                Ok(PbPlanNode {
-                    children: vec![left_child],
-                    identity,
-                    node_body: Some(node_body),
-                })
-            }
             _ => {
                 let children = execution_plan_node
                     .children
@@ -656,15 +343,6 @@ impl FastInsertExecution {
                 })
             }
         }
-    }
-
-    #[inline(always)]
-    fn get_fragment_id(&self, table_id: &TableId) -> SchedulerResult<FragmentId> {
-        let reader = self.front_env.catalog_reader().read_guard();
-        reader
-            .get_any_table_by_id(table_id)
-            .map(|table| table.fragment_id)
-            .map_err(|e| SchedulerError::Internal(anyhow!(e)))
     }
 
     #[inline(always)]
@@ -714,4 +392,85 @@ impl FastInsertExecution {
             Ok(workers)
         }
     }
+}
+
+pub async fn run_inner_call(
+    plan_node: &PlanFragment,
+    epoch: BatchQueryEpoch,
+    context: FrontendBatchTaskContext,
+) -> Result<(), BoxedError> {
+    let mut stream = Box::pin(run_inner(plan_node.clone(), epoch, context))
+        .map(|r| r.map_err(|e| Box::new(e) as BoxedError));
+    while let Some(r) = stream.next().await {
+        let _ = r?;
+    }
+    Ok(())
+}
+
+#[try_stream(ok = DataChunk, error = RwError)]
+async fn run_inner(plan: PlanFragment, epoch: BatchQueryEpoch, context: FrontendBatchTaskContext) {
+    let task_id = TaskId {
+        query_id: String::from("WXKLOG"),
+        stage_id: 0,
+        task_id: 0,
+    };
+    let plan_node = plan.root.unwrap();
+    let executor = ExecutorBuilder::new(
+        &plan_node,
+        &task_id,
+        context,
+        epoch,
+        // self.shutdown_rx().clone(),
+        ShutdownToken::empty(),
+    );
+
+    let executor = executor.build().await?;
+
+    println!("WKXLOG executor: {:?}", executor);
+
+    #[for_await]
+    for chunk in executor.execute() {
+        yield chunk?;
+    }
+    // while let Some(result) = executor.execute().next().await {
+    //     result?;
+    // }
+    // Ok(())
+}
+
+pub async fn run_inner_call_2(
+    plan_node: &PlanFragment,
+    epoch: BatchQueryEpoch,
+    context: FrontendBatchTaskContext,
+    session: Arc<SessionImpl>,
+) -> Result<(), BoxedError> {
+    // let compute_runtime = self.front_env.compute_runtime();
+
+    let catalog_reader = session.env().catalog_reader().clone();
+    let user_info_reader = session.env().user_info_reader().clone();
+    let auth_context = session.auth_context().clone();
+    let db_name = session.database().to_string();
+    let search_path = session.config().search_path();
+    let time_zone = session.config().timezone();
+    let strict_mode = session.config().batch_expr_strict_mode();
+    let meta_client = session.env().meta_client_ref();
+
+    let exec = async move { run_inner_call(plan_node, epoch, context).await };
+
+    use risingwave_expr::expr_context::*;
+
+    use crate::expr::function_impl::context::{
+        AUTH_CONTEXT, CATALOG_READER, DB_NAME, META_CLIENT, SEARCH_PATH, USER_INFO_READER,
+    };
+
+    // box is necessary, otherwise the size of `exec` will double each time it is nested.
+    let exec = async move { CATALOG_READER::scope(catalog_reader, exec).await }.boxed();
+    let exec = async move { USER_INFO_READER::scope(user_info_reader, exec).await }.boxed();
+    let exec = async move { DB_NAME::scope(db_name, exec).await }.boxed();
+    let exec = async move { SEARCH_PATH::scope(search_path, exec).await }.boxed();
+    let exec = async move { AUTH_CONTEXT::scope(auth_context, exec).await }.boxed();
+    let exec = async move { TIME_ZONE::scope(time_zone, exec).await }.boxed();
+    let exec = async move { STRICT_MODE::scope(strict_mode, exec).await }.boxed();
+    let exec = async move { META_CLIENT::scope(meta_client, exec).await }.boxed();
+    exec.await
 }
