@@ -71,10 +71,10 @@ pub(super) mod handlers {
         // Can be any address, we use the port of meta to indicate that it's a internal request.
         let dummy_addr = Address::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 5691));
 
-        println!(
-            "WKXLOG Received webhook request for {}/{}/{}",
-            database, schema, table
-        );
+        // println!(
+        //     "WKXLOG Received webhook request for {}/{}/{}",
+        //     database, schema, table
+        // );
         // TODO(kexiang): optimize this
         // get a session object for the corresponding database
         let session = session_mgr
@@ -88,7 +88,7 @@ pub(super) mod handlers {
                     StatusCode::UNAUTHORIZED,
                 )
             })?;
-        println!("WKXLOG session created");
+        // println!("WKXLOG session created");
         let WebhookSourceInfo {
             secret_ref,
             signature_expr,
@@ -112,7 +112,7 @@ pub(super) mod handlers {
                 })?
                 .clone()
         };
-        println!("WKXLOG webhook source info: {:?}", secret_ref);
+        // println!("WKXLOG webhook source info: {:?}", secret_ref);
 
         // let secret_string = LocalSecretManager::global()
         //     .fill_secret(secret_ref.unwrap())
@@ -120,7 +120,7 @@ pub(super) mod handlers {
 
         let secret_string = String::from("TEST_WEBHOOK");
 
-        println!("WKXLOG secret string: {:?}", secret_string);
+        // println!("WKXLOG secret string: {:?}", secret_string);
         // Once limitation here is that the key is no longer case-insensitive, users must user the lowercase key when defining the webhook source table.
         let headers_jsonb = header_map_to_json(&headers);
 
@@ -132,7 +132,7 @@ pub(super) mod handlers {
         )
         .await?;
 
-        println!("WKXLOG is_valid: {:?}", is_valid);
+        // println!("WKXLOG is_valid: {:?}", is_valid);
 
         if !is_valid {
             return Err(err(
@@ -164,7 +164,7 @@ pub(super) mod handlers {
             returning: vec![],
         };
 
-        println!("WKXLOG insert_stmt done");
+        // println!("WKXLOG insert_stmt done");
 
         let _guard = session.txn_begin_implicit();
         let handler_args =
@@ -180,7 +180,7 @@ pub(super) mod handlers {
         let execution = handle_fast_insert(handler_args, insert_stmt)
             .await
             .map_err(|e| {
-                println!("WKXLOG handle_fast_insert error: {:?}", e);
+                // println!("WKXLOG handle_fast_insert error: {:?}", e);
                 err(
                     anyhow!(e).context("Failed to insert into target table"),
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -196,7 +196,7 @@ pub(super) mod handlers {
         run_inner_call_2(&plan, epoch, context, session)
             .await
             .map_err(|e| {
-                println!("WKXLOG run_inner_call error: {:?}", e);
+                // println!("WKXLOG run_inner_call error: {:?}", e);
                 err(
                     anyhow!(e).context("Failed to insert into target table"),
                     StatusCode::INTERNAL_SERVER_ERROR,

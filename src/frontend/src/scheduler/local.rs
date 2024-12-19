@@ -111,7 +111,7 @@ impl LocalQueryExecution {
         let plan_fragment = self.create_plan_fragment()?;
         let plan_node = plan_fragment.root.unwrap();
 
-        println!("WKXLOG plan_node: {:?}", plan_node);
+        // println!("WKXLOG plan_node: {:?}", plan_node);
 
         let executor = ExecutorBuilder::new(
             &plan_node,
@@ -123,7 +123,7 @@ impl LocalQueryExecution {
 
         let executor = executor.build().await?;
 
-        println!("WKXLOG executor: {:?}", executor);
+        // println!("WKXLOG executor: {:?}", executor);
 
         #[for_await]
         for chunk in executor.execute() {
